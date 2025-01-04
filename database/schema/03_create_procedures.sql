@@ -1,60 +1,79 @@
 /*
- * Retailability Namibia - Inventory Management System
- * Stored Procedures
- * 
- * Description: Creates all stored procedures for business operations
+ * Retailability Namibia - Stored Procedures
  * Author: Tileni
- * Created: January 2024
- * 
- * Prerequisites: 
- * - 01_create_tables.sql must be executed first
- * - 02_create_triggers.sql must be executed first
- * 
- * Procedures created:
- * - TransferStock: Handles stock transfers between stores
- * - GetChainStockStatus: Reports on chain-wide stock levels
- * - AnalyzeProductPerformance: Product performance analytics
- * - CompareStorePerformance: Store performance comparison
- * - AnalyzeInventoryAge: Stock aging analysis
- * - AnalyzeSeasonalPerformance: Seasonal trends analysis
+ * Created: 4 January 2024
+ *
+ * This script creates stored procedures for:
+ * - Inventory Management
+ * - Layby Processing
+ * - Credit Account Management
+ * - Reporting
  */
 
 USE RetailabilityNamibia;
-
 DELIMITER //
 
 /*
- * Procedure: TransferStock
- * Handles the transfer of stock between stores
- * 
- * Parameters:
- * - p_from_store_id: Source store
- * - p_to_store_id: Destination store
- * - p_product_id: Product to transfer
- * - p_quantity: Amount to transfer
- * - p_reference: Transaction reference
+ * Inventory Management Procedures
  */
-CREATE PROCEDURE TransferStock(
+
+-- Add new stock to inventory
+CREATE PROCEDURE sp_AddStock(
+    IN p_store_product_id INT,
+    IN p_quantity INT,
+    IN p_employee_id INT
+)
+BEGIN
+    DECLARE current_stock INT;
+    
+    -- Get current stock level
+    SELECT AvailableStock INTO current_stock
+    FROM Inventory
+    WHERE StoreProductID = p_store_product_id;
+    
+    -- Update inventory
+    UPDATE Inventory
+    SET AvailableStock = AvailableStock + p_quantity,
+        LastUpdated = CURRENT_TIMESTAMP
+    WHERE StoreProductID = p_store_product_id;
+    
+    -- Log the stock addition
+    INSERT INTO SystemAuditLog (
+        EntityType, EntityID, UserID, Action, Details, Severity
+    )
+    VALUES (
+        'INVENTORY',
+        p_store_product_id,
+        p_employee_id,
+        'STOCK_ADDED',
+        CONCAT('Added ', p_quantity, ' units. Previous stock: ', current_stock),
+        'INFO'
+    );
+END//
+
+-- Transfer stock between stores
+CREATE PROCEDURE sp_TransferStock(
     IN p_from_store_id INT,
     IN p_to_store_id INT,
     IN p_product_id INT,
     IN p_quantity INT,
-    IN p_reference VARCHAR(50)
+    IN p_employee_id INT
 )
 BEGIN
     DECLARE v_from_store_product_id INT;
     DECLARE v_to_store_product_id INT;
-    DECLARE v_current_stock INT;
+    DECLARE v_available_stock INT;
     
-    -- Validate sufficient stock
-    SELECT StoreProductID, i.Quantity 
-    INTO v_from_store_product_id, v_current_stock
+    -- Get source store product ID and check stock
+    SELECT StoreProductID, i.AvailableStock
+    INTO v_from_store_product_id, v_available_stock
     FROM StoreProducts sp
     JOIN Inventory i ON sp.StoreProductID = i.StoreProductID
     WHERE sp.StoreID = p_from_store_id 
     AND sp.ProductID = p_product_id;
     
-    IF v_current_stock < p_quantity THEN
+    -- Validate stock availability
+    IF v_available_stock < p_quantity THEN
         SIGNAL SQLSTATE '45000'
         SET MESSAGE_TEXT = 'Insufficient stock for transfer';
     END IF;
@@ -65,52 +84,157 @@ BEGIN
     WHERE StoreID = p_to_store_id 
     AND ProductID = p_product_id;
     
-    -- Create stock movement record
-    INSERT INTO StockMovements (
-        FromStoreID,
-        ToStoreID,
-        StoreProductID,
-        Quantity,
-        MovementType,
-        Reference
-    ) VALUES (
-        p_from_store_id,
-        p_to_store_id,
+    -- Start transaction
+    START TRANSACTION;
+    
+    -- Reduce stock from source
+    UPDATE Inventory
+    SET AvailableStock = AvailableStock - p_quantity
+    WHERE StoreProductID = v_from_store_product_id;
+    
+    -- Add stock to destination
+    UPDATE Inventory
+    SET AvailableStock = AvailableStock + p_quantity
+    WHERE StoreProductID = v_to_store_product_id;
+    
+    -- Record transfer
+    INSERT INTO SystemAuditLog (
+        EntityType, EntityID, UserID, Action, Details, Severity
+    )
+    VALUES (
+        'STOCK_TRANSFER',
         v_from_store_product_id,
-        p_quantity,
+        p_employee_id,
         'TRANSFER',
-        p_reference
+        CONCAT('Transferred ', p_quantity, ' units from Store ', p_from_store_id, ' to Store ', p_to_store_id),
+        'INFO'
+    );
+    
+    COMMIT;
+END//
+
+/*
+ * Layby Management Procedures
+ */
+
+-- Create new layby
+CREATE PROCEDURE sp_CreateLayby(
+    IN p_customer_id INT,
+    IN p_store_product_id INT,
+    IN p_employee_id INT,
+    IN p_total_amount DECIMAL(10,2),
+    IN p_deposit_amount DECIMAL(10,2),
+    IN p_deposit_percentage DECIMAL(5,2)
+)
+BEGIN
+    DECLARE v_balance_due DECIMAL(10,2);
+    
+    -- Calculate balance due
+    SET v_balance_due = p_total_amount - p_deposit_amount;
+    
+    -- Validate minimum deposit
+    IF (p_deposit_amount / p_total_amount * 100) < p_deposit_percentage THEN
+        SIGNAL SQLSTATE '45000'
+        SET MESSAGE_TEXT = 'Deposit amount is below required percentage';
+    END IF;
+    
+    -- Create layby transaction
+    INSERT INTO LaybyTransactions (
+        CustomerID,
+        StoreProductID,
+        EmployeeID,
+        TotalAmount,
+        DepositPaid,
+        BalanceDue,
+        DepositPercentage,
+        StartDate,
+        DueDate
+    )
+    VALUES (
+        p_customer_id,
+        p_store_product_id,
+        p_employee_id,
+        p_total_amount,
+        p_deposit_amount,
+        v_balance_due,
+        p_deposit_percentage,
+        CURRENT_TIMESTAMP,
+        DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 6 MONTH)
+    );
+    
+    -- Update inventory (trigger will handle stock reservation)
+END//
+
+/*
+ * Credit Account Management
+ */
+
+-- Process credit account payment
+CREATE PROCEDURE sp_ProcessCreditPayment(
+    IN p_account_id INT,
+    IN p_payment_amount DECIMAL(10,2),
+    IN p_employee_id INT
+)
+BEGIN
+    DECLARE v_current_balance DECIMAL(10,2);
+    DECLARE v_new_balance DECIMAL(10,2);
+    
+    -- Get current balance
+    SELECT CurrentBalance INTO v_current_balance
+    FROM CreditAccounts
+    WHERE AccountID = p_account_id;
+    
+    SET v_new_balance = v_current_balance - p_payment_amount;
+    
+    -- Update account
+    UPDATE CreditAccounts
+    SET CurrentBalance = v_new_balance,
+        LastPaymentDate = CURRENT_TIMESTAMP,
+        LastPaymentAmount = p_payment_amount,
+        NextPaymentDueDate = DATE_ADD(CURRENT_TIMESTAMP, INTERVAL 1 MONTH)
+    WHERE AccountID = p_account_id;
+    
+    -- Log payment
+    INSERT INTO SystemAuditLog (
+        EntityType, EntityID, UserID, Action, Details, Severity
+    )
+    VALUES (
+        'CREDIT_ACCOUNT',
+        p_account_id,
+        p_employee_id,
+        'PAYMENT',
+        CONCAT('Payment of ', p_payment_amount, ' processed. New balance: ', v_new_balance),
+        'INFO'
     );
 END//
 
 /*
- * Procedure: AnalyzeProductPerformance
- * Analyzes product performance over a specified period
+ * Reporting Procedures
  */
-CREATE PROCEDURE AnalyzeProductPerformance(
-    IN p_chain_id INT,
-    IN p_date_from DATE,
-    IN p_date_to DATE
+
+-- Get store performance report
+CREATE PROCEDURE sp_GetStorePerformance(
+    IN p_store_id INT,
+    IN p_start_date DATE,
+    IN p_end_date DATE
 )
 BEGIN
+    -- Add your report query here
+    -- This is a placeholder for the actual implementation
     SELECT 
-        p.ProductName,
-        p.SKU,
-        SUM(sm.Quantity) as TotalUnitsSold,
-        SUM(sm.Quantity * sp.UnitPrice) as TotalRevenue,
-        COUNT(DISTINCT sm.MovementID) as NumberOfTransactions,
-        AVG(sp.UnitPrice) as AveragePrice
-    FROM StockMovements sm
-    JOIN StoreProducts sp ON sm.StoreProductID = sp.StoreProductID
-    JOIN Products p ON sp.ProductID = p.ProductID
-    JOIN Stores s ON sp.StoreID = s.StoreID
-    WHERE s.ChainID = p_chain_id
-    AND sm.MovementType = 'SALES'
-    AND DATE(sm.MovementDate) BETWEEN p_date_from AND p_date_to
-    GROUP BY p.ProductName, p.SKU
-    ORDER BY TotalRevenue DESC;
+        s.StoreName,
+        COUNT(DISTINCT l.LaybyID) as TotalLaybys,
+        SUM(l.TotalAmount) as TotalLaybyAmount,
+        COUNT(DISTINCT c.AccountID) as ActiveCreditAccounts,
+        SUM(c.CurrentBalance) as TotalCreditBalance
+    FROM Stores s
+    LEFT JOIN LaybyTransactions l ON s.StoreID = 
+        (SELECT StoreID FROM StoreProducts WHERE StoreProductID = l.StoreProductID)
+        AND l.StartDate BETWEEN p_start_date AND p_end_date
+    LEFT JOIN Customers cu ON l.CustomerID = cu.CustomerID
+    LEFT JOIN CreditAccounts c ON cu.CustomerID = c.CustomerID
+    WHERE s.StoreID = p_store_id
+    GROUP BY s.StoreName;
 END//
-
-/* Add more procedures here... */
 
 DELIMITER ;
